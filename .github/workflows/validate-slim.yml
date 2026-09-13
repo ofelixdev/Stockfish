@@ -130,9 +130,12 @@ jobs:
           echo "release_tag=" >> $GITHUB_OUTPUT
         fi
     - name: Scope the fixture tag to this run and runner
-      run: echo "release_tag=${{ steps.prerelease_metadata.outputs.release_tag }}-${{ github.run_id }}-latest" >>
-        "$GITHUB_OUTPUT"
+      run: |-
+        test -n "$SOURCE_TAG"
+        echo "release_tag=$SOURCE_TAG-${{ github.run_id }}-latest" >> "$GITHUB_OUTPUT"
       id: scoped_tag
+      env:
+        SOURCE_TAG: ${{ steps.prerelease_metadata.outputs.release_tag }}
     - name: Get commits in this push
       id: recent_commits
       run: |
@@ -375,9 +378,12 @@ jobs:
           echo "release_tag=" >> $GITHUB_OUTPUT
         fi
     - name: Scope the fixture tag to this run and runner
-      run: echo "release_tag=${{ steps.prerelease_metadata.outputs.release_tag }}-${{ github.run_id }}-slim" >>
-        "$GITHUB_OUTPUT"
+      run: |-
+        test -n "$SOURCE_TAG"
+        echo "release_tag=$SOURCE_TAG-${{ github.run_id }}-slim" >> "$GITHUB_OUTPUT"
       id: scoped_tag
+      env:
+        SOURCE_TAG: ${{ steps.prerelease_metadata.outputs.release_tag }}
     - name: Get commits in this push
       id: recent_commits
       run: |
@@ -688,7 +694,7 @@ jobs:
       run: |
         set -euo pipefail
         ARCHIVE="stockfish-$NAME-$BINARY.$ARCHIVE_EXT"
-        python3 .validation/verify_package.py verify --fixture stockfish-workflow --wiki stockfish/wiki --archive "$ARCHIVE" --binary-name "stockfish-$NAME-$BINARY$EXT" --manifest ".validation-results/$LABEL-$CASE_ID.json"
+        python3 .validation/verify_package.py verify --fixture stockfish-workflow --wiki stockfish/wiki --archive "$ARCHIVE" --binary-name "stockfish-$NAME-$BINARY$EXT" --manifest "validation-results/$LABEL-$CASE_ID.json"
         python3 - <<'PY'
         import hashlib, json, os, pathlib
         name = f"stockfish-{os.environ['NAME']}-{os.environ['BINARY']}.{os.environ['ARCHIVE_EXT']}"
@@ -696,7 +702,7 @@ jobs:
         with path.open('rb') as stream:
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         result = {'archive': name, 'sha256': digest, 'size': path.stat().st_size, 'case_id': os.environ['CASE_ID'], 'label': os.environ['LABEL']}
-        pathlib.Path(f".validation-results/{result['label']}-{result['case_id']}.meta.json").write_text(json.dumps(result, indent=2) + '\n')
+        pathlib.Path(f"validation-results/{result['label']}-{result['case_id']}.meta.json").write_text(json.dumps(result, indent=2) + '\n')
         PY
     - name: Upload development draft asset
       if: env.DEV_TAG != ''
@@ -719,7 +725,8 @@ jobs:
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: manifest-${{ matrix.label }}-${{ matrix.case_id }}
-        path: .validation-results/*
+        path: validation-results/*
+        if-no-files-found: error
         retention-days: 1
     needs:
     - DevLatest
@@ -790,10 +797,10 @@ jobs:
     - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         pattern: manifest-*
-        path: .validation-results
+        path: validation-results
         merge-multiple: true
     - name: Verify control versus slim and every uploaded asset
-      run: python3 .validation/verify_live_results.py --results .validation-results --output validation-summary.json
+      run: python3 .validation/verify_live_results.py --results validation-results --output validation-summary.json
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       if: always()
       with:

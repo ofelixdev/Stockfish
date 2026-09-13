@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate fork-only runner comparisons from the actual candidate workflows."""
 
+import argparse
 import copy
 import json
 from pathlib import Path
@@ -10,9 +11,13 @@ import shutil
 import yaml
 
 
-ROOT = Path(__file__).resolve().parent
-SOURCE = ROOT.parent / "stockfish"
-TARGET = ROOT.parent / "stockfish-validation-checkout"
+HERE = Path(__file__).resolve().parent
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--source', type=Path, default=HERE.parent if HERE.name == '.validation' else HERE.parent / 'stockfish')
+parser.add_argument('--target', type=Path, default=HERE.parent if HERE.name == '.validation' else HERE.parent / 'stockfish-validation-checkout')
+parser.add_argument('--helpers', type=Path, default=HERE)
+args = parser.parse_args()
+ROOT, SOURCE, TARGET = args.helpers.resolve(), args.source.resolve(), args.target.resolve()
 CHECKOUT = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
 UPLOAD = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 DOWNLOAD = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
@@ -68,8 +73,10 @@ validation = TARGET / ".validation"
 validation.mkdir(exist_ok=True)
 (validation / "source.json").write_text(json.dumps(sources, indent=2) + "\n")
 for name in ("verify_package.py", "test_verify_package.py", "verify_release_logic.py", "verify_live_results.py"):
-    shutil.copy2(ROOT / name, validation / name)
-shutil.copy2(__file__, validation / "generate_workflow.py")
+    if (ROOT / name).resolve() != (validation / name).resolve():
+        shutil.copy2(ROOT / name, validation / name)
+if Path(__file__).resolve() != (validation / 'generate_workflow.py').resolve():
+    shutil.copy2(__file__, validation / "generate_workflow.py")
 
 jobs = {}
 for label, runner in (("Latest", "ubuntu-latest"), ("Slim", "ubuntu-slim")):
@@ -132,8 +139,9 @@ gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SH
         if name == "Compute prerelease metadata":
             revised_steps.append(step(
                 "Scope the fixture tag to this run and runner",
-                f'echo "release_tag=${{{{ steps.prerelease_metadata.outputs.release_tag }}}}-{RUN_ID}-{label.lower()}" >> "$GITHUB_OUTPUT"',
+                f'test -n "$SOURCE_TAG"\necho "release_tag=$SOURCE_TAG-{RUN_ID}-{label.lower()}" >> "$GITHUB_OUTPUT"',
                 id="scoped_tag",
+                env={"SOURCE_TAG": "${{ steps.prerelease_metadata.outputs.release_tag }}"},
             ))
         if name == "Get Latest Dev Prerelease Tag":
             revised_steps.append(step("Verify selection ignores stable releases", 'test "$COMMIT_SHA_TAG" = "$PREVIOUS_TAG"'))
@@ -191,7 +199,7 @@ for original_step in package["steps"]:
     if original_step.get("name") == "Upload Draft Release Asset":
         new_steps.append(step("Verify every packaged file and record archive digest", '''set -euo pipefail
 ARCHIVE="stockfish-$NAME-$BINARY.$ARCHIVE_EXT"
-python3 .validation/verify_package.py verify --fixture stockfish-workflow --wiki stockfish/wiki --archive "$ARCHIVE" --binary-name "stockfish-$NAME-$BINARY$EXT" --manifest ".validation-results/$LABEL-$CASE_ID.json"
+python3 .validation/verify_package.py verify --fixture stockfish-workflow --wiki stockfish/wiki --archive "$ARCHIVE" --binary-name "stockfish-$NAME-$BINARY$EXT" --manifest "validation-results/$LABEL-$CASE_ID.json"
 python3 - <<'PY'
 import hashlib, json, os, pathlib
 name = f"stockfish-{os.environ['NAME']}-{os.environ['BINARY']}.{os.environ['ARCHIVE_EXT']}"
@@ -199,7 +207,7 @@ path = pathlib.Path(name)
 with path.open('rb') as stream:
     digest = hashlib.file_digest(stream, 'sha256').hexdigest()
 result = {'archive': name, 'sha256': digest, 'size': path.stat().st_size, 'case_id': os.environ['CASE_ID'], 'label': os.environ['LABEL']}
-pathlib.Path(f".validation-results/{result['label']}-{result['case_id']}.meta.json").write_text(json.dumps(result, indent=2) + '\\n')
+pathlib.Path(f"validation-results/{result['label']}-{result['case_id']}.meta.json").write_text(json.dumps(result, indent=2) + '\\n')
 PY
 '''))
         for prerelease, tag in ((True, "DEV_TAG"), (False, "OFFICIAL_TAG")):
@@ -208,7 +216,7 @@ PY
             upload["if"] = f"env.{tag} != ''"
             upload["with"].update({"tag_name": "${{ env." + tag + " }}", "prerelease": prerelease, "token": "${{ github.token }}"})
             new_steps.append(upload)
-        new_steps.append({"uses": UPLOAD, "with": {"name": "manifest-${{ matrix.label }}-${{ matrix.case_id }}", "path": ".validation-results/*", "retention-days": 1}})
+        new_steps.append({"uses": UPLOAD, "with": {"name": "manifest-${{ matrix.label }}-${{ matrix.case_id }}", "path": "validation-results/*", "if-no-files-found": "error", "retention-days": 1}})
     else:
         new_steps.append(original_step)
 package["steps"] = new_steps
@@ -229,8 +237,8 @@ jobs["Verify"] = {
     "env": {"GH_TOKEN": "${{ github.token }}", "NEEDS_JSON": "${{ toJson(needs) }}"},
     "steps": [
         {"uses": CHECKOUT, "with": {"persist-credentials": False}},
-        {"uses": DOWNLOAD, "with": {"pattern": "manifest-*", "path": ".validation-results", "merge-multiple": True}},
-        step("Verify control versus slim and every uploaded asset", "python3 .validation/verify_live_results.py --results .validation-results --output validation-summary.json"),
+        {"uses": DOWNLOAD, "with": {"pattern": "manifest-*", "path": "validation-results", "merge-multiple": True}},
+        step("Verify control versus slim and every uploaded asset", "python3 .validation/verify_live_results.py --results validation-results --output validation-summary.json"),
         {"uses": UPLOAD, "if": "always()", "with": {"name": "validation-summary", "path": "validation-summary.json", "retention-days": 1}},
     ],
 }
