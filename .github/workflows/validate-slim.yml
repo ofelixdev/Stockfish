@@ -1,0 +1,38 @@
+name: Validate slim runner access
+on:
+  push:
+    branches: [validate/ubuntu-slim]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  Probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-slim]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Check tools and public artifact access
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 --version
+          git --version
+          gh --version
+          jq --version
+          tar --version
+          command -v gzip zip unzip
+          gh api repos/official-stockfish/Stockfish/actions/artifacts/10314293144/zip > "$RUNNER_TEMP/fixture.zip"
+          python3 - "$RUNNER_TEMP/fixture.zip" <<'PY'
+          import pathlib, sys, zipfile
+          path = pathlib.Path(sys.argv[1])
+          with zipfile.ZipFile(path) as archive:
+              assert archive.testzip() is None
+              assert 'stockfish-linux-x86-64-universal' in archive.namelist()
+              print('Verified real upstream compilation artifact:', path.stat().st_size, 'bytes')
+          PY
