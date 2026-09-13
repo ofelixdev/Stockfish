@@ -262,7 +262,7 @@ for label, number in [('Latest', '1'), ('Slim', '2')]:
 for tag in tags:
     repo = os.environ['GITHUB_REPOSITORY']
     if subprocess.run(['gh', 'release', 'view', tag, '--repo', repo], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        subprocess.run(['gh', 'release', 'delete', tag, '--repo', repo, '--yes', '--cleanup-tag'], check=True)
+        subprocess.run(['gh', 'release', 'delete', tag, '--repo', repo, '--yes'], check=True)
     if subprocess.run(['gh', 'api', f'repos/{repo}/git/ref/tags/{tag}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         subprocess.run(['gh', 'api', '--method', 'DELETE', f'repos/{repo}/git/refs/tags/{tag}'], check=True)
 print('Removed only the releases and tags created by this validation run')

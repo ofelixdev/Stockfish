@@ -14,6 +14,15 @@ def gh_json(*args):
     return json.loads(subprocess.check_output(["gh", *args], text=True))
 
 
+def fetch_release(repo, tag):
+    # gh resolves draft tags through GraphQL; the REST tag endpoint only serves
+    # published releases. Fetch the full REST payload by the resolved numeric ID.
+    identity = gh_json("release", "view", tag, "--repo", repo, "--json", "databaseId")
+    release = gh_json("api", f"repos/{repo}/releases/{identity['databaseId']}")
+    assert release["tag_name"] == tag, (tag, release["tag_name"])
+    return release
+
+
 def verify(results, summary):
     repo = os.environ["GITHUB_REPOSITORY"]
     assert repo == "ofelixdev/Stockfish", repo
@@ -44,7 +53,7 @@ def verify(results, summary):
         assert len(expected) == 8
         for kind, draft, prerelease in (("Dev", False, True), ("Official", True, False)):
             tag = needs[kind + label]["outputs"]["release_tag"]
-            release = gh_json("api", f"repos/{repo}/releases/tags/{tag}")
+            release = fetch_release(repo, tag)
             assert release["draft"] is draft and release["prerelease"] is prerelease, (tag, release["draft"], release["prerelease"])
             assert {asset["name"] for asset in release["assets"]} == set(expected), tag
             assert len(release["assets"]) == 8
