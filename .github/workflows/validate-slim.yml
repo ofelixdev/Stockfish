@@ -785,7 +785,7 @@ jobs:
     - PublishSlim
     if: always()
     permissions:
-      contents: read
+      contents: write
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}

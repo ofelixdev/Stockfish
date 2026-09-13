@@ -233,7 +233,8 @@ for label, runner in (("Latest", "ubuntu-latest"), ("Slim", "ubuntu-slim")):
 all_previous = list(jobs)
 jobs["Verify"] = {
     "name": "Compare all payloads and download all release assets", "runs-on": "ubuntu-latest",
-    "needs": all_previous, "if": "always()", "permissions": {"contents": "read", "actions": "read"},
+    # GitHub requires push access to inspect unpublished draft releases.
+    "needs": all_previous, "if": "always()", "permissions": {"contents": "write", "actions": "read"},
     "env": {"GH_TOKEN": "${{ github.token }}", "NEEDS_JSON": "${{ toJson(needs) }}"},
     "steps": [
         {"uses": CHECKOUT, "with": {"persist-credentials": False}},
