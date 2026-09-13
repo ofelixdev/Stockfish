@@ -53,7 +53,9 @@ jobs:
           EOF
                 ;;
               bullseye)
-                echo "Debian Bullseye detected. Disabling repository expiry checks..."
+                echo "Debian Bullseye detected. Using a security repository snapshot..."
+                # Debian #1147093: the live security repository references missing packages.
+                sed -i 's|http://deb\.debian\.org/debian-security|https://snapshot.debian.org/archive/debian-security/20260903T220410Z|g' /etc/apt/sources.list
                 ;;
             esac
             echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99-ignore-valid-until
