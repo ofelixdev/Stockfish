@@ -1,38 +1,849 @@
-name: Validate slim runner access
-on:
+name: Validate lightweight release jobs on ubuntu-slim
+'on':
   push:
-    branches: [validate/ubuntu-slim]
+    branches:
+    - validate/ubuntu-slim
 permissions:
   contents: read
   actions: read
+concurrency:
+  group: stockfish-slim-validation
+  cancel-in-progress: false
 jobs:
-  Probe:
+  MatrixLatest:
+    name: stockfish matrices on ubuntu-latest
+    runs-on: ubuntu-latest
+    outputs:
+      arm_matrix: ${{ steps.set-arm-matrix.outputs.arm_matrix }}
+      universal_matrix: ${{ steps.set-universal-matrix.outputs.universal_matrix }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - id: set-arm-matrix
+      run: |
+        ARM_MATRIX=$(jq -c '.' .github/ci/arm_matrix.json)
+        echo "ARM_MATRIX=$ARM_MATRIX" >> $GITHUB_OUTPUT
+    - id: set-universal-matrix
+      run: |
+        UNIVERSAL_MATRIX=$(jq -c '.' .github/ci/universal_matrix.json)
+        echo "UNIVERSAL_MATRIX=$UNIVERSAL_MATRIX" >> $GITHUB_OUTPUT
+    - name: Verify actual matrix outputs
+      run: |
+        python3 - <<'PY'
+        import json, os, pathlib
+        for kind in ('arm', 'universal'):
+            expected = json.loads(pathlib.Path(f'.github/ci/{kind}_matrix.json').read_text())
+            actual = json.loads(os.environ[kind.upper() + '_ACTUAL'])
+            assert actual == expected, kind
+        print('Both matrix outputs match the checked-in inputs')
+        PY
+      env:
+        ARM_ACTUAL: ${{ steps.set-arm-matrix.outputs.arm_matrix }}
+        UNIVERSAL_ACTUAL: ${{ steps.set-universal-matrix.outputs.universal_matrix }}
+  OfficialMatrixLatest:
+    runs-on: ubuntu-latest
+    outputs:
+      universal_matrix: ${{ steps.set-universal-matrix.outputs.universal_matrix }}
+      arm_matrix: ${{ steps.set-arm-matrix.outputs.arm_matrix }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - id: set-universal-matrix
+      run: |
+        UNIVERSAL_MATRIX=$(jq -c '.' .github/ci/universal_matrix.json)
+        echo "UNIVERSAL_MATRIX=$UNIVERSAL_MATRIX" >> $GITHUB_OUTPUT
+    - id: set-arm-matrix
+      run: |
+        ARM_MATRIX=$(jq -c '.' .github/ci/arm_matrix.json)
+        echo "ARM_MATRIX=$ARM_MATRIX" >> $GITHUB_OUTPUT
+    - name: Verify actual matrix outputs
+      run: |
+        python3 - <<'PY'
+        import json, os, pathlib
+        for kind in ('arm', 'universal'):
+            expected = json.loads(pathlib.Path(f'.github/ci/{kind}_matrix.json').read_text())
+            actual = json.loads(os.environ[kind.upper() + '_ACTUAL'])
+            assert actual == expected, kind
+        print('Both matrix outputs match the checked-in inputs')
+        PY
+      env:
+        ARM_ACTUAL: ${{ steps.set-arm-matrix.outputs.arm_matrix }}
+        UNIVERSAL_ACTUAL: ${{ steps.set-universal-matrix.outputs.universal_matrix }}
+    name: official_release matrices on ubuntu-latest
+  LogicLatest:
+    name: Release decision cases on ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - name: Test the archive verifier
+      run: python3 -m unittest discover -s .validation -p 'test_verify_package.py' -v
+    - name: Exercise the original release scripts
+      run: python3 .validation/verify_release_logic.py --source-json .validation/source.json --output release-logic.json
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: release-logic-latest
+        path: release-logic.json
+        retention-days: 1
+  DevLatest:
+    if: github.repository == 'ofelixdev/Stockfish'
+    runs-on: ubuntu-latest
+    needs:
+    - MatrixLatest
+    outputs:
+      release_tag: ${{ steps.scoped_tag.outputs.release_tag }}
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Check Pullable Commits
+      id: check_commits
+      run: |
+        git fetch
+        CHANGES=$(git rev-list HEAD..origin/master --count)
+        echo "CHANGES=$CHANGES" >> $GITHUB_ENV
+    - name: Official Release?
+      id: official_release
+      run: |
+        if git log -1 --pretty=%B | grep -q "Official release version of Stockfish"; then
+          echo "OFFICIAL_RELEASE=true" >> $GITHUB_ENV
+        else
+          echo "OFFICIAL_RELEASE=false" >> $GITHUB_ENV
+        fi
+    - name: Compute prerelease metadata
+      id: prerelease_metadata
+      run: |
+        COMMIT_SHA=$(git rev-parse HEAD | cut -c 1-8)
+        COMMIT_DATE=$(git show -s --date=format:'%Y%m%d' --format=%cd HEAD)
+
+        if [[ "master" == 'master' && "$CHANGES" == '0' && "$OFFICIAL_RELEASE" == 'false' ]]; then
+          echo "release_name=Stockfish dev-$COMMIT_DATE-$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "release_tag=stockfish-dev-$COMMIT_DATE-$COMMIT_SHA" >> $GITHUB_OUTPUT
+        else
+          echo "release_name=" >> $GITHUB_OUTPUT
+          echo "release_tag=" >> $GITHUB_OUTPUT
+        fi
+    - name: Scope the fixture tag to this run and runner
+      run: echo "release_tag=${{ steps.prerelease_metadata.outputs.release_tag }}-${{ github.run_id }}-latest" >>
+        "$GITHUB_OUTPUT"
+      id: scoped_tag
+    - name: Get commits in this push
+      id: recent_commits
+      run: |
+        COMMITS=$(git log \
+          --format="- [\`%h\`](https://github.com/${{ github.repository }}/commit/%H) *%s*" \
+          ${{ github.event.before }}..HEAD)
+        echo "COMMITS<<EOF" >> $GITHUB_OUTPUT
+        echo "$COMMITS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    - name: Exercise no previous prerelease
+      if: steps.scoped_tag.outputs.release_tag != ''
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        COMMIT_SHA_TAG=$(gh release list --repo "${{ github.repository }}" --exclude-drafts --limit 100 --json tagName,isPrerelease | jq -r 'map(select(.isPrerelease)) | first | .tagName // "null"')
+        echo "COMMIT_SHA_TAG=$COMMIT_SHA_TAG" >> "$GITHUB_ENV"
+    - name: Verify empty prerelease lookup
+      run: test "$COMMIT_SHA_TAG" = null
+    - name: Create known previous and stable release fixtures
+      run: |
+        set -euo pipefail
+        gh release create "$PREVIOUS_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Temporary runner validation" --notes "Temporary fixture for Stockfish issue 7080."
+        gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Temporary stable fixture" --notes "Temporary fixture; removed by this workflow."
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Get Latest Dev Prerelease Tag
+      if: steps.scoped_tag.outputs.release_tag != ''
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        COMMIT_SHA_TAG=$(gh release list --repo "${{ github.repository }}" --exclude-drafts --limit 100 --json tagName,isPrerelease | jq -r 'map(select(.isPrerelease)) | first | .tagName // "null"')
+        echo "COMMIT_SHA_TAG=$COMMIT_SHA_TAG" >> "$GITHUB_ENV"
+    - name: Verify selection ignores stable releases
+      run: test "$COMMIT_SHA_TAG" = "$PREVIOUS_TAG"
+    - name: Delete Previous Dev Prerelease
+      if: steps.scoped_tag.outputs.release_tag != '' && env.COMMIT_SHA_TAG != 'null'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release delete "${{ env.COMMIT_SHA_TAG }}" --repo "${{ github.repository }}" --cleanup-tag
+    - name: Verify previous release and tag were deleted
+      run: |
+        set -euo pipefail
+        if gh release view "$PREVIOUS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then exit 1; fi
+        if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$PREVIOUS_TAG" >/dev/null 2>&1; then exit 1; fi
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Create Draft Prerelease
+      if: steps.scoped_tag.outputs.release_tag != ''
+      uses: softprops/action-gh-release@4634c16e79c963813287e889244c50009e7f0981
+      with:
+        name: ${{ steps.prerelease_metadata.outputs.release_name }}
+        tag_name: ${{ steps.scoped_tag.outputs.release_tag }}
+        draft: true
+        prerelease: true
+        body: "Precompiled binaries of the latest Stockfish development version, built automatically on every commit.\n\
+          \n> [!NOTE]\n> For stable, thoroughly tested builds use the [official releases](https://github.com/official-stockfish/Stockfish/releases).\n\
+          > Pre-releases may contain bugs.\n\n*Some platforms ship a **universal binary** that automatically selects\
+          \ the best\ninstruction set for your CPU - no manual selection needed.*\n\n---\n\n## Commits\n\n${{ steps.recent_commits.outputs.COMMITS\
+          \ }}\n\n[View all commits \u2192](https://github.com/${{ github.repository }}/commits/master)\n"
+    name: Create development draft on ubuntu-latest
+    env:
+      PREVIOUS_TAG: validation-previous-${{ github.run_id }}-latest
+      STABLE_TAG: validation-stable-${{ github.run_id }}-latest
+  OfficialLatest:
+    if: github.repository == 'ofelixdev/Stockfish'
+    runs-on: ubuntu-latest
+    needs:
+    - OfficialMatrixLatest
+    outputs:
+      release_tag: ${{ steps.release_metadata.outputs.release_tag }}
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+        ref: ${{ github.ref }}
+    - name: Validate release request
+      env:
+        RELEASE_TAG: sf_7080.${{ github.run_id }}1
+        RELEASE_TITLE: Temporary official draft on ubuntu-latest
+      run: |
+        if [[ "master" != 'master' ]]; then
+          echo 'Official releases must be dispatched from master.'
+          exit 1
+        fi
+
+        if [[ ! "$RELEASE_TAG" =~ ^sf_[0-9]+(\.[0-9]+)?$ ]]; then
+          echo 'release_tag must match sf_X or sf_X.Y'
+          exit 1
+        fi
+
+        if [[ -z "$RELEASE_TITLE" ]]; then
+          echo 'release_title is required.'
+          exit 1
+        fi
+    - name: Compute release metadata
+      id: release_metadata
+      run: echo "release_tag=sf_7080.${{ github.run_id }}1" >> $GITHUB_OUTPUT
+    - name: Ensure tag does not already exist
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release view "sf_7080.${{ github.run_id }}1" >/dev/null 2>&1 && { echo 'Release already exists for
+        this tag.'; exit 1; } || true
+    - name: Ensure git tag does not already exist
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh api "repos/${{ github.repository }}/git/ref/tags/sf_7080.${{ github.run_id }}1" >/dev/null 2>&1 &&
+        { echo 'Tag already exists.'; exit 1; } || true
+    - name: Create official release tag
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh api "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/sf_7080.${{ github.run_id }}1" -f
+        sha="${{ github.sha }}"
+    - name: Create draft official release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release create "sf_7080.${{ github.run_id }}1" --draft --title "Temporary official draft on ubuntu-latest"
+        --notes ''
+    name: Create official draft on ubuntu-latest
+  MatrixSlim:
+    name: stockfish matrices on ubuntu-slim
+    runs-on: ubuntu-slim
+    outputs:
+      arm_matrix: ${{ steps.set-arm-matrix.outputs.arm_matrix }}
+      universal_matrix: ${{ steps.set-universal-matrix.outputs.universal_matrix }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - id: set-arm-matrix
+      run: |
+        ARM_MATRIX=$(jq -c '.' .github/ci/arm_matrix.json)
+        echo "ARM_MATRIX=$ARM_MATRIX" >> $GITHUB_OUTPUT
+    - id: set-universal-matrix
+      run: |
+        UNIVERSAL_MATRIX=$(jq -c '.' .github/ci/universal_matrix.json)
+        echo "UNIVERSAL_MATRIX=$UNIVERSAL_MATRIX" >> $GITHUB_OUTPUT
+    - name: Verify actual matrix outputs
+      run: |
+        python3 - <<'PY'
+        import json, os, pathlib
+        for kind in ('arm', 'universal'):
+            expected = json.loads(pathlib.Path(f'.github/ci/{kind}_matrix.json').read_text())
+            actual = json.loads(os.environ[kind.upper() + '_ACTUAL'])
+            assert actual == expected, kind
+        print('Both matrix outputs match the checked-in inputs')
+        PY
+      env:
+        ARM_ACTUAL: ${{ steps.set-arm-matrix.outputs.arm_matrix }}
+        UNIVERSAL_ACTUAL: ${{ steps.set-universal-matrix.outputs.universal_matrix }}
+  OfficialMatrixSlim:
+    runs-on: ubuntu-slim
+    outputs:
+      universal_matrix: ${{ steps.set-universal-matrix.outputs.universal_matrix }}
+      arm_matrix: ${{ steps.set-arm-matrix.outputs.arm_matrix }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - id: set-universal-matrix
+      run: |
+        UNIVERSAL_MATRIX=$(jq -c '.' .github/ci/universal_matrix.json)
+        echo "UNIVERSAL_MATRIX=$UNIVERSAL_MATRIX" >> $GITHUB_OUTPUT
+    - id: set-arm-matrix
+      run: |
+        ARM_MATRIX=$(jq -c '.' .github/ci/arm_matrix.json)
+        echo "ARM_MATRIX=$ARM_MATRIX" >> $GITHUB_OUTPUT
+    - name: Verify actual matrix outputs
+      run: |
+        python3 - <<'PY'
+        import json, os, pathlib
+        for kind in ('arm', 'universal'):
+            expected = json.loads(pathlib.Path(f'.github/ci/{kind}_matrix.json').read_text())
+            actual = json.loads(os.environ[kind.upper() + '_ACTUAL'])
+            assert actual == expected, kind
+        print('Both matrix outputs match the checked-in inputs')
+        PY
+      env:
+        ARM_ACTUAL: ${{ steps.set-arm-matrix.outputs.arm_matrix }}
+        UNIVERSAL_ACTUAL: ${{ steps.set-universal-matrix.outputs.universal_matrix }}
+    name: official_release matrices on ubuntu-slim
+  LogicSlim:
+    name: Release decision cases on ubuntu-slim
+    runs-on: ubuntu-slim
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - name: Test the archive verifier
+      run: python3 -m unittest discover -s .validation -p 'test_verify_package.py' -v
+    - name: Exercise the original release scripts
+      run: python3 .validation/verify_release_logic.py --source-json .validation/source.json --output release-logic.json
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: release-logic-slim
+        path: release-logic.json
+        retention-days: 1
+  DevSlim:
+    if: github.repository == 'ofelixdev/Stockfish'
+    runs-on: ubuntu-slim
+    needs:
+    - MatrixSlim
+    - DevLatest
+    outputs:
+      release_tag: ${{ steps.scoped_tag.outputs.release_tag }}
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+    - name: Check Pullable Commits
+      id: check_commits
+      run: |
+        git fetch
+        CHANGES=$(git rev-list HEAD..origin/master --count)
+        echo "CHANGES=$CHANGES" >> $GITHUB_ENV
+    - name: Official Release?
+      id: official_release
+      run: |
+        if git log -1 --pretty=%B | grep -q "Official release version of Stockfish"; then
+          echo "OFFICIAL_RELEASE=true" >> $GITHUB_ENV
+        else
+          echo "OFFICIAL_RELEASE=false" >> $GITHUB_ENV
+        fi
+    - name: Compute prerelease metadata
+      id: prerelease_metadata
+      run: |
+        COMMIT_SHA=$(git rev-parse HEAD | cut -c 1-8)
+        COMMIT_DATE=$(git show -s --date=format:'%Y%m%d' --format=%cd HEAD)
+
+        if [[ "master" == 'master' && "$CHANGES" == '0' && "$OFFICIAL_RELEASE" == 'false' ]]; then
+          echo "release_name=Stockfish dev-$COMMIT_DATE-$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "release_tag=stockfish-dev-$COMMIT_DATE-$COMMIT_SHA" >> $GITHUB_OUTPUT
+        else
+          echo "release_name=" >> $GITHUB_OUTPUT
+          echo "release_tag=" >> $GITHUB_OUTPUT
+        fi
+    - name: Scope the fixture tag to this run and runner
+      run: echo "release_tag=${{ steps.prerelease_metadata.outputs.release_tag }}-${{ github.run_id }}-slim" >>
+        "$GITHUB_OUTPUT"
+      id: scoped_tag
+    - name: Get commits in this push
+      id: recent_commits
+      run: |
+        COMMITS=$(git log \
+          --format="- [\`%h\`](https://github.com/${{ github.repository }}/commit/%H) *%s*" \
+          ${{ github.event.before }}..HEAD)
+        echo "COMMITS<<EOF" >> $GITHUB_OUTPUT
+        echo "$COMMITS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    - name: Exercise no previous prerelease
+      if: steps.scoped_tag.outputs.release_tag != ''
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        COMMIT_SHA_TAG=$(gh release list --repo "${{ github.repository }}" --exclude-drafts --limit 100 --json tagName,isPrerelease | jq -r 'map(select(.isPrerelease)) | first | .tagName // "null"')
+        echo "COMMIT_SHA_TAG=$COMMIT_SHA_TAG" >> "$GITHUB_ENV"
+    - name: Verify empty prerelease lookup
+      run: test "$COMMIT_SHA_TAG" = null
+    - name: Create known previous and stable release fixtures
+      run: |
+        set -euo pipefail
+        gh release create "$PREVIOUS_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease --title "Temporary runner validation" --notes "Temporary fixture for Stockfish issue 7080."
+        gh release create "$STABLE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Temporary stable fixture" --notes "Temporary fixture; removed by this workflow."
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Get Latest Dev Prerelease Tag
+      if: steps.scoped_tag.outputs.release_tag != ''
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        COMMIT_SHA_TAG=$(gh release list --repo "${{ github.repository }}" --exclude-drafts --limit 100 --json tagName,isPrerelease | jq -r 'map(select(.isPrerelease)) | first | .tagName // "null"')
+        echo "COMMIT_SHA_TAG=$COMMIT_SHA_TAG" >> "$GITHUB_ENV"
+    - name: Verify selection ignores stable releases
+      run: test "$COMMIT_SHA_TAG" = "$PREVIOUS_TAG"
+    - name: Delete Previous Dev Prerelease
+      if: steps.scoped_tag.outputs.release_tag != '' && env.COMMIT_SHA_TAG != 'null'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release delete "${{ env.COMMIT_SHA_TAG }}" --repo "${{ github.repository }}" --cleanup-tag
+    - name: Verify previous release and tag were deleted
+      run: |
+        set -euo pipefail
+        if gh release view "$PREVIOUS_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then exit 1; fi
+        if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$PREVIOUS_TAG" >/dev/null 2>&1; then exit 1; fi
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Create Draft Prerelease
+      if: steps.scoped_tag.outputs.release_tag != ''
+      uses: softprops/action-gh-release@4634c16e79c963813287e889244c50009e7f0981
+      with:
+        name: ${{ steps.prerelease_metadata.outputs.release_name }}
+        tag_name: ${{ steps.scoped_tag.outputs.release_tag }}
+        draft: true
+        prerelease: true
+        body: "Precompiled binaries of the latest Stockfish development version, built automatically on every commit.\n\
+          \n> [!NOTE]\n> For stable, thoroughly tested builds use the [official releases](https://github.com/official-stockfish/Stockfish/releases).\n\
+          > Pre-releases may contain bugs.\n\n*Some platforms ship a **universal binary** that automatically selects\
+          \ the best\ninstruction set for your CPU - no manual selection needed.*\n\n---\n\n## Commits\n\n${{ steps.recent_commits.outputs.COMMITS\
+          \ }}\n\n[View all commits \u2192](https://github.com/${{ github.repository }}/commits/master)\n"
+    name: Create development draft on ubuntu-slim
+    env:
+      PREVIOUS_TAG: validation-previous-${{ github.run_id }}-slim
+      STABLE_TAG: validation-stable-${{ github.run_id }}-slim
+  OfficialSlim:
+    if: github.repository == 'ofelixdev/Stockfish'
+    runs-on: ubuntu-slim
+    needs:
+    - OfficialMatrixSlim
+    outputs:
+      release_tag: ${{ steps.release_metadata.outputs.release_tag }}
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+        fetch-depth: 0
+        ref: ${{ github.ref }}
+    - name: Validate release request
+      env:
+        RELEASE_TAG: sf_7080.${{ github.run_id }}2
+        RELEASE_TITLE: Temporary official draft on ubuntu-slim
+      run: |
+        if [[ "master" != 'master' ]]; then
+          echo 'Official releases must be dispatched from master.'
+          exit 1
+        fi
+
+        if [[ ! "$RELEASE_TAG" =~ ^sf_[0-9]+(\.[0-9]+)?$ ]]; then
+          echo 'release_tag must match sf_X or sf_X.Y'
+          exit 1
+        fi
+
+        if [[ -z "$RELEASE_TITLE" ]]; then
+          echo 'release_title is required.'
+          exit 1
+        fi
+    - name: Compute release metadata
+      id: release_metadata
+      run: echo "release_tag=sf_7080.${{ github.run_id }}2" >> $GITHUB_OUTPUT
+    - name: Ensure tag does not already exist
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release view "sf_7080.${{ github.run_id }}2" >/dev/null 2>&1 && { echo 'Release already exists for
+        this tag.'; exit 1; } || true
+    - name: Ensure git tag does not already exist
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh api "repos/${{ github.repository }}/git/ref/tags/sf_7080.${{ github.run_id }}2" >/dev/null 2>&1 &&
+        { echo 'Tag already exists.'; exit 1; } || true
+    - name: Create official release tag
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh api "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/sf_7080.${{ github.run_id }}2" -f
+        sha="${{ github.sha }}"
+    - name: Create draft official release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release create "sf_7080.${{ github.run_id }}2" --draft --title "Temporary official draft on ubuntu-slim"
+        --notes ''
+    name: Create official draft on ubuntu-slim
+  Packages:
+    name: Package ${{ matrix.case_id }} on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      EXT: ${{ matrix.config.ext }}
+      NAME: ${{ matrix.config.simple_name }}
+      BINARY: ${{ matrix.binaries }}
+      DEV_TAG: ${{ matrix.label == 'latest' && needs.DevLatest.outputs.release_tag || needs.DevSlim.outputs.release_tag
+        }}
+      OFFICIAL_TAG: ${{ matrix.label == 'latest' && needs.OfficialLatest.outputs.release_tag || needs.OfficialSlim.outputs.release_tag
+        }}
+      CASE_ID: ${{ matrix.case_id }}
+      LABEL: ${{ matrix.label }}
+      ARCHIVE_EXT: ${{ matrix.config.archive_ext }}
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-slim]
-    runs-on: ${{ matrix.runner }}
+        include:
+        - config: &id001
+            name: Ubuntu 22.04 GCC Universal
+            os: ubuntu-22.04
+            simple_name: linux
+            archive_ext: tar.gz
+          binaries: x86-64-universal
+          label: latest
+          runner: ubuntu-latest
+          case_id: linux-x86-64-universal
+        - config: &id002
+            name: Windows 2022 Mingw-w64 GCC Universal
+            os: windows-2022
+            simple_name: windows
+            ext: .exe
+            archive_ext: zip
+          binaries: x86-64-universal
+          label: latest
+          runner: ubuntu-latest
+          case_id: windows-x86-64-universal
+        - config: &id003
+            name: Ubuntu 22.04 GCC Universal arm64
+            os: ubuntu-22.04-arm
+            simple_name: linux
+            archive_ext: tar.gz
+          binaries: arm64-universal
+          label: latest
+          runner: ubuntu-latest
+          case_id: linux-arm64-universal
+        - config: &id004
+            name: Ubuntu 22.04 GCC Universal riscv64
+            os: ubuntu-22.04
+            simple_name: linux
+            archive_ext: tar.gz
+          binaries: riscv64-universal
+          label: latest
+          runner: ubuntu-latest
+          case_id: linux-riscv64-universal
+        - config: &id005
+            name: Windows 11 Clang Universal arm64
+            os: windows-11-arm
+            simple_name: windows
+            ext: .exe
+            archive_ext: zip
+          binaries: arm64-universal
+          label: latest
+          runner: ubuntu-latest
+          case_id: windows-arm64-universal
+        - config: &id006
+            name: macOS 15 Apple Clang Universal
+            os: macos-15
+            simple_name: macos
+            archive_ext: tar.gz
+          binaries: universal
+          label: latest
+          runner: ubuntu-latest
+          case_id: macos-universal
+        - config: &id007
+            name: Android NDK aarch64
+            os: ubuntu-22.04
+            simple_name: android
+            compiler: aarch64-linux-android29-clang++
+            emu: qemu-aarch64
+            comp: ndk
+            shell: bash
+            archive_ext: tar.gz
+          binaries: arm64-universal
+          label: latest
+          runner: ubuntu-latest
+          case_id: android-arm64-universal
+        - config: &id008
+            name: Android NDK arm
+            os: ubuntu-22.04
+            simple_name: android
+            compiler: armv7a-linux-androideabi29-clang++
+            emu: qemu-arm
+            comp: ndk
+            shell: bash
+            archive_ext: tar.gz
+          binaries: armv7-neon
+          label: latest
+          runner: ubuntu-latest
+          case_id: android-armv7-neon
+        - config: *id001
+          binaries: x86-64-universal
+          label: slim
+          runner: ubuntu-slim
+          case_id: linux-x86-64-universal
+        - config: *id002
+          binaries: x86-64-universal
+          label: slim
+          runner: ubuntu-slim
+          case_id: windows-x86-64-universal
+        - config: *id003
+          binaries: arm64-universal
+          label: slim
+          runner: ubuntu-slim
+          case_id: linux-arm64-universal
+        - config: *id004
+          binaries: riscv64-universal
+          label: slim
+          runner: ubuntu-slim
+          case_id: linux-riscv64-universal
+        - config: *id005
+          binaries: arm64-universal
+          label: slim
+          runner: ubuntu-slim
+          case_id: windows-arm64-universal
+        - config: *id006
+          binaries: universal
+          label: slim
+          runner: ubuntu-slim
+          case_id: macos-universal
+        - config: *id007
+          binaries: arm64-universal
+          label: slim
+          runner: ubuntu-slim
+          case_id: android-arm64-universal
+        - config: *id008
+          binaries: armv7-neon
+          label: slim
+          runner: ubuntu-slim
+          case_id: android-armv7-neon
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          persist-credentials: false
-      - name: Check tools and public artifact access
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 --version
-          git --version
-          gh --version
-          jq --version
-          tar --version
-          command -v gzip zip unzip
-          gh api repos/official-stockfish/Stockfish/actions/artifacts/10314293144/zip > "$RUNNER_TEMP/fixture.zip"
-          python3 - "$RUNNER_TEMP/fixture.zip" <<'PY'
-          import pathlib, sys, zipfile
-          path = pathlib.Path(sys.argv[1])
-          with zipfile.ZipFile(path) as archive:
-              assert archive.testzip() is None
-              assert 'stockfish-linux-x86-64-universal' in archive.namelist()
-              print('Verified real upstream compilation artifact:', path.stat().st_size, 'bytes')
-          PY
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - name: Download artifact from compilation
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: ${{ matrix.config.simple_name }} ${{ matrix.binaries }}
+        path: ${{ matrix.config.simple_name }} ${{ matrix.binaries }}
+        repository: official-stockfish/Stockfish
+        run-id: 34745589340
+        github-token: ${{ github.token }}
+    - name: Create Package
+      run: |
+        mkdir stockfish
+    - name: Download wiki
+      run: |
+        git clone https://github.com/official-stockfish/Stockfish.wiki.git wiki
+        rm -rf wiki/.git
+        mv wiki stockfish/
+    - name: Copy files
+      run: |
+        mv "${{ matrix.config.simple_name }} ${{ matrix.binaries }}" stockfish-workflow
+        cd stockfish-workflow
+        cp -r src ../stockfish/
+        cp -r scripts ../stockfish/
+        cp stockfish-$NAME-$BINARY$EXT ../stockfish/
+        cp "Top CPU Contributors.txt" ../stockfish/
+        cp Copying.txt ../stockfish/
+        cp AUTHORS ../stockfish/
+        cp CITATION.cff ../stockfish/
+        cp README.md ../stockfish/
+        cp CONTRIBUTING.md ../stockfish/
+    - name: Create tar
+      if: ${{ startsWith(matrix.config.archive_ext, 'tar') }}
+      run: |
+        chmod +x ./stockfish/stockfish-$NAME-$BINARY$EXT
+        tar -cavf stockfish-$NAME-$BINARY."${{ matrix.config.archive_ext }}" stockfish
+    - name: Create zip
+      if: ${{ matrix.config.archive_ext == 'zip' }}
+      run: |
+        zip -r stockfish-$NAME-$BINARY.zip stockfish
+    - name: Verify every packaged file and record archive digest
+      run: |
+        set -euo pipefail
+        ARCHIVE="stockfish-$NAME-$BINARY.$ARCHIVE_EXT"
+        python3 .validation/verify_package.py verify --fixture stockfish-workflow --wiki stockfish/wiki --archive "$ARCHIVE" --binary-name "stockfish-$NAME-$BINARY$EXT" --manifest ".validation-results/$LABEL-$CASE_ID.json"
+        python3 - <<'PY'
+        import hashlib, json, os, pathlib
+        name = f"stockfish-{os.environ['NAME']}-{os.environ['BINARY']}.{os.environ['ARCHIVE_EXT']}"
+        path = pathlib.Path(name)
+        with path.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        result = {'archive': name, 'sha256': digest, 'size': path.stat().st_size, 'case_id': os.environ['CASE_ID'], 'label': os.environ['LABEL']}
+        pathlib.Path(f".validation-results/{result['label']}-{result['case_id']}.meta.json").write_text(json.dumps(result, indent=2) + '\n')
+        PY
+    - name: Upload development draft asset
+      if: env.DEV_TAG != ''
+      uses: softprops/action-gh-release@4634c16e79c963813287e889244c50009e7f0981
+      with:
+        tag_name: ${{ env.DEV_TAG }}
+        draft: true
+        prerelease: true
+        files: stockfish-${{ matrix.config.simple_name }}-${{ matrix.binaries }}.${{ matrix.config.archive_ext }}
+        token: ${{ github.token }}
+    - name: Upload official draft asset
+      if: env.OFFICIAL_TAG != ''
+      uses: softprops/action-gh-release@4634c16e79c963813287e889244c50009e7f0981
+      with:
+        tag_name: ${{ env.OFFICIAL_TAG }}
+        draft: true
+        prerelease: false
+        files: stockfish-${{ matrix.config.simple_name }}-${{ matrix.binaries }}.${{ matrix.config.archive_ext }}
+        token: ${{ github.token }}
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: manifest-${{ matrix.label }}-${{ matrix.case_id }}
+        path: .validation-results/*
+        retention-days: 1
+    needs:
+    - DevLatest
+    - DevSlim
+    - OfficialLatest
+    - OfficialSlim
+    permissions:
+      contents: write
+      actions: read
+  PublishLatest:
+    if: github.repository == 'ofelixdev/Stockfish' && needs.DevLatest.outputs.release_tag != ''
+    needs:
+    - DevLatest
+    - Packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Publish Draft Prerelease
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release edit "${{ needs.DevLatest.outputs.release_tag }}" --repo "${{ github.repository }}" --draft=false
+        --prerelease
+    name: Publish the verified development draft on ubuntu-latest
+  PublishSlim:
+    if: github.repository == 'ofelixdev/Stockfish' && needs.DevSlim.outputs.release_tag != ''
+    needs:
+    - DevSlim
+    - Packages
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    steps:
+    - name: Publish Draft Prerelease
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release edit "${{ needs.DevSlim.outputs.release_tag }}" --repo "${{ github.repository }}" --draft=false
+        --prerelease
+    name: Publish the verified development draft on ubuntu-slim
+  Verify:
+    name: Compare all payloads and download all release assets
+    runs-on: ubuntu-latest
+    needs:
+    - MatrixLatest
+    - OfficialMatrixLatest
+    - LogicLatest
+    - DevLatest
+    - OfficialLatest
+    - MatrixSlim
+    - OfficialMatrixSlim
+    - LogicSlim
+    - DevSlim
+    - OfficialSlim
+    - Packages
+    - PublishLatest
+    - PublishSlim
+    if: always()
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NEEDS_JSON: ${{ toJson(needs) }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        pattern: manifest-*
+        path: .validation-results
+        merge-multiple: true
+    - name: Verify control versus slim and every uploaded asset
+      run: python3 .validation/verify_live_results.py --results .validation-results --output validation-summary.json
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      if: always()
+      with:
+        name: validation-summary
+        path: validation-summary.json
+        retention-days: 1
+  Cleanup:
+    name: Remove this run's temporary releases and tags
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+    - MatrixLatest
+    - OfficialMatrixLatest
+    - LogicLatest
+    - DevLatest
+    - OfficialLatest
+    - MatrixSlim
+    - OfficialMatrixSlim
+    - LogicSlim
+    - DevSlim
+    - OfficialSlim
+    - Packages
+    - PublishLatest
+    - PublishSlim
+    - Verify
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NEEDS_JSON: ${{ toJson(needs) }}
+    steps:
+    - name: Clean up only known test fixtures in the fork
+      run: |
+        python3 - <<'PY'
+        import json, os, subprocess
+        assert os.environ['GITHUB_REPOSITORY'] == 'ofelixdev/Stockfish'
+        run = os.environ['GITHUB_RUN_ID']
+        needs = json.loads(os.environ['NEEDS_JSON'])
+        tags = []
+        for label, number in [('Latest', '1'), ('Slim', '2')]:
+            tags += [f'validation-previous-{run}-{label.lower()}', f'validation-stable-{run}-{label.lower()}', f'sf_7080.{run}{number}']
+            dev = needs['Dev' + label].get('outputs', {}).get('release_tag')
+            if dev:
+                assert dev.startswith('stockfish-dev-') and dev.endswith(f'-{run}-{label.lower()}')
+                tags.append(dev)
+        for tag in tags:
+            repo = os.environ['GITHUB_REPOSITORY']
+            if subprocess.run(['gh', 'release', 'view', tag, '--repo', repo], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                subprocess.run(['gh', 'release', 'delete', tag, '--repo', repo, '--yes', '--cleanup-tag'], check=True)
+            if subprocess.run(['gh', 'api', f'repos/{repo}/git/ref/tags/{tag}'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                subprocess.run(['gh', 'api', '--method', 'DELETE', f'repos/{repo}/git/refs/tags/{tag}'], check=True)
+        print('Removed only the releases and tags created by this validation run')
+        PY

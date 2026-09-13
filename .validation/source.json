@@ -1,0 +1,510 @@
+{
+  "stockfish": {
+    "name": "Stockfish",
+    "on": {
+      "push": {
+        "branches": [
+          "master",
+          "tools",
+          "github_ci"
+        ]
+      },
+      "pull_request": {
+        "branches": [
+          "master",
+          "tools"
+        ]
+      }
+    },
+    "concurrency": {
+      "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+      "cancel-in-progress": true
+    },
+    "jobs": {
+      "Prerelease": {
+        "if": "github.repository == 'official-stockfish/Stockfish' && github.event_name == 'push' && github.ref == 'refs/heads/master'",
+        "runs-on": "ubuntu-slim",
+        "needs": [
+          "Matrix",
+          "ARMCompilation",
+          "UniversalCompilation"
+        ],
+        "outputs": {
+          "release_tag": "${{ steps.prerelease_metadata.outputs.release_tag }}"
+        },
+        "permissions": {
+          "contents": "write"
+        },
+        "steps": [
+          {
+            "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            "with": {
+              "persist-credentials": false,
+              "fetch-depth": 0
+            }
+          },
+          {
+            "name": "Check Pullable Commits",
+            "id": "check_commits",
+            "run": "git fetch\nCHANGES=$(git rev-list HEAD..origin/master --count)\necho \"CHANGES=$CHANGES\" >> $GITHUB_ENV\n"
+          },
+          {
+            "name": "Official Release?",
+            "id": "official_release",
+            "run": "if git log -1 --pretty=%B | grep -q \"Official release version of Stockfish\"; then\n  echo \"OFFICIAL_RELEASE=true\" >> $GITHUB_ENV\nelse\n  echo \"OFFICIAL_RELEASE=false\" >> $GITHUB_ENV\nfi\n"
+          },
+          {
+            "name": "Compute prerelease metadata",
+            "id": "prerelease_metadata",
+            "run": "COMMIT_SHA=$(git rev-parse HEAD | cut -c 1-8)\nCOMMIT_DATE=$(git show -s --date=format:'%Y%m%d' --format=%cd HEAD)\n\nif [[ \"${{ github.ref_name }}\" == 'master' && \"$CHANGES\" == '0' && \"$OFFICIAL_RELEASE\" == 'false' ]]; then\n  echo \"release_name=Stockfish dev-$COMMIT_DATE-$COMMIT_SHA\" >> $GITHUB_OUTPUT\n  echo \"release_tag=stockfish-dev-$COMMIT_DATE-$COMMIT_SHA\" >> $GITHUB_OUTPUT\nelse\n  echo \"release_name=\" >> $GITHUB_OUTPUT\n  echo \"release_tag=\" >> $GITHUB_OUTPUT\nfi\n"
+          },
+          {
+            "name": "Get commits in this push",
+            "id": "recent_commits",
+            "run": "COMMITS=$(git log \\\n  --format=\"- [\\`%h\\`](https://github.com/${{ github.repository }}/commit/%H) *%s*\" \\\n  ${{ github.event.before }}..HEAD)\necho \"COMMITS<<EOF\" >> $GITHUB_OUTPUT\necho \"$COMMITS\" >> $GITHUB_OUTPUT\necho \"EOF\" >> $GITHUB_OUTPUT\n"
+          },
+          {
+            "name": "Get Latest Dev Prerelease Tag",
+            "if": "steps.prerelease_metadata.outputs.release_tag != ''",
+            "env": {
+              "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"
+            },
+            "run": "COMMIT_SHA_TAG=$(gh release list --repo \"${{ github.repository }}\" --exclude-drafts --limit 100 --json tagName,isPrerelease | jq -r 'map(select(.isPrerelease)) | first | .tagName // \"null\"')\necho \"COMMIT_SHA_TAG=$COMMIT_SHA_TAG\" >> \"$GITHUB_ENV\"\n"
+          },
+          {
+            "name": "Delete Previous Dev Prerelease",
+            "if": "steps.prerelease_metadata.outputs.release_tag != '' && env.COMMIT_SHA_TAG != 'null'",
+            "env": {
+              "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"
+            },
+            "run": "gh release delete \"${{ env.COMMIT_SHA_TAG }}\" --repo \"${{ github.repository }}\" --cleanup-tag"
+          },
+          {
+            "name": "Create Draft Prerelease",
+            "if": "steps.prerelease_metadata.outputs.release_tag != ''",
+            "uses": "softprops/action-gh-release@4634c16e79c963813287e889244c50009e7f0981",
+            "with": {
+              "name": "${{ steps.prerelease_metadata.outputs.release_name }}",
+              "tag_name": "${{ steps.prerelease_metadata.outputs.release_tag }}",
+              "draft": true,
+              "prerelease": true,
+              "body": "Precompiled binaries of the latest Stockfish development version, built automatically on every commit.\n\n> [!NOTE]\n> For stable, thoroughly tested builds use the [official releases](https://github.com/official-stockfish/Stockfish/releases).\n> Pre-releases may contain bugs.\n\n*Some platforms ship a **universal binary** that automatically selects the best\ninstruction set for your CPU - no manual selection needed.*\n\n---\n\n## Commits\n\n${{ steps.recent_commits.outputs.COMMITS }}\n\n[View all commits \u2192](https://github.com/${{ github.repository }}/commits/master)\n"
+            }
+          }
+        ]
+      },
+      "Matrix": {
+        "name": "Prepare matrices",
+        "runs-on": "ubuntu-slim",
+        "outputs": {
+          "arm_matrix": "${{ steps.set-arm-matrix.outputs.arm_matrix }}",
+          "universal_matrix": "${{ steps.set-universal-matrix.outputs.universal_matrix }}"
+        },
+        "steps": [
+          {
+            "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            "with": {
+              "persist-credentials": false
+            }
+          },
+          {
+            "id": "set-arm-matrix",
+            "run": "ARM_MATRIX=$(jq -c '.' .github/ci/arm_matrix.json)\necho \"ARM_MATRIX=$ARM_MATRIX\" >> $GITHUB_OUTPUT\n"
+          },
+          {
+            "id": "set-universal-matrix",
+            "run": "UNIVERSAL_MATRIX=$(jq -c '.' .github/ci/universal_matrix.json)\necho \"UNIVERSAL_MATRIX=$UNIVERSAL_MATRIX\" >> $GITHUB_OUTPUT\n"
+          }
+        ]
+      },
+      "IWYU": {
+        "name": "IWYU",
+        "uses": "./.github/workflows/iwyu.yml"
+      },
+      "Sanitizers": {
+        "name": "Sanitizers",
+        "if": "${{ always() }}",
+        "uses": "./.github/workflows/sanitizers.yml"
+      },
+      "Tests": {
+        "name": "Tests",
+        "if": "${{ always() }}",
+        "uses": "./.github/workflows/tests.yml"
+      },
+      "Matetrack": {
+        "name": "Matetrack",
+        "if": "${{ always() }}",
+        "uses": "./.github/workflows/matetrack.yml"
+      },
+      "Games": {
+        "name": "Games",
+        "if": "${{ always() }}",
+        "uses": "./.github/workflows/games.yml"
+      },
+      "CompilerCheck": {
+        "name": "Compiler check",
+        "if": "${{ always() }}",
+        "uses": "./.github/workflows/avx2_compilers.yml"
+      },
+      "MSVC": {
+        "name": "MSVC",
+        "if": "${{ always() }}",
+        "uses": "./.github/workflows/msvc.yml"
+      },
+      "WASMCompilation": {
+        "name": "WASM compilation",
+        "if": "${{ always() }}",
+        "uses": "./.github/workflows/wasm_compilation.yml"
+      },
+      "ARMCompilation": {
+        "name": "Android builds",
+        "needs": [
+          "Matrix",
+          "Sanitizers",
+          "Tests",
+          "Matetrack",
+          "Games",
+          "CompilerCheck"
+        ],
+        "uses": "./.github/workflows/arm_compilation.yml",
+        "with": {
+          "matrix": "${{ needs.Matrix.outputs.arm_matrix }}"
+        }
+      },
+      "UniversalCompilation": {
+        "name": "Universal builds",
+        "needs": [
+          "Matrix",
+          "Sanitizers",
+          "Tests",
+          "Matetrack",
+          "Games",
+          "CompilerCheck"
+        ],
+        "uses": "./.github/workflows/universal_compilation.yml"
+      },
+      "DevBinaries": {
+        "if": "github.repository == 'official-stockfish/Stockfish'",
+        "name": "Universal uploads",
+        "needs": [
+          "Prerelease",
+          "Matrix",
+          "UniversalCompilation"
+        ],
+        "uses": "./.github/workflows/upload_binaries.yml",
+        "with": {
+          "matrix": "${{ needs.Matrix.outputs.universal_matrix }}",
+          "release_tag": "${{ needs.Prerelease.outputs.release_tag }}",
+          "release_prerelease": true
+        },
+        "permissions": {
+          "contents": "write"
+        },
+        "secrets": {
+          "token": "${{ secrets.GITHUB_TOKEN }}"
+        }
+      },
+      "DevARMBinaries": {
+        "if": "github.repository == 'official-stockfish/Stockfish'",
+        "name": "Android uploads",
+        "needs": [
+          "Prerelease",
+          "Matrix",
+          "ARMCompilation"
+        ],
+        "uses": "./.github/workflows/upload_binaries.yml",
+        "with": {
+          "matrix": "${{ needs.Matrix.outputs.arm_matrix }}",
+          "release_tag": "${{ needs.Prerelease.outputs.release_tag }}",
+          "release_prerelease": true
+        },
+        "permissions": {
+          "contents": "write"
+        },
+        "secrets": {
+          "token": "${{ secrets.GITHUB_TOKEN }}"
+        }
+      },
+      "PublishPrerelease": {
+        "if": "github.repository == 'official-stockfish/Stockfish' && needs.Prerelease.outputs.release_tag != ''",
+        "needs": [
+          "Prerelease",
+          "DevBinaries",
+          "DevARMBinaries"
+        ],
+        "runs-on": "ubuntu-slim",
+        "permissions": {
+          "contents": "write"
+        },
+        "steps": [
+          {
+            "name": "Publish Draft Prerelease",
+            "env": {
+              "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"
+            },
+            "run": "gh release edit \"${{ needs.Prerelease.outputs.release_tag }}\" --repo \"${{ github.repository }}\" --draft=false --prerelease"
+          }
+        ]
+      }
+    }
+  },
+  "official_release": {
+    "name": "Official Release",
+    "on": {
+      "workflow_dispatch": {
+        "inputs": {
+          "release_tag": {
+            "description": "Official release tag in the form sf_X or sf_X.Y",
+            "required": true,
+            "type": "string"
+          },
+          "release_title": {
+            "description": "Official release title",
+            "required": true,
+            "type": "string"
+          }
+        }
+      }
+    },
+    "jobs": {
+      "Matrix": {
+        "runs-on": "ubuntu-slim",
+        "outputs": {
+          "universal_matrix": "${{ steps.set-universal-matrix.outputs.universal_matrix }}",
+          "arm_matrix": "${{ steps.set-arm-matrix.outputs.arm_matrix }}"
+        },
+        "steps": [
+          {
+            "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            "with": {
+              "persist-credentials": false
+            }
+          },
+          {
+            "id": "set-universal-matrix",
+            "run": "UNIVERSAL_MATRIX=$(jq -c '.' .github/ci/universal_matrix.json)\necho \"UNIVERSAL_MATRIX=$UNIVERSAL_MATRIX\" >> $GITHUB_OUTPUT\n"
+          },
+          {
+            "id": "set-arm-matrix",
+            "run": "ARM_MATRIX=$(jq -c '.' .github/ci/arm_matrix.json)\necho \"ARM_MATRIX=$ARM_MATRIX\" >> $GITHUB_OUTPUT\n"
+          }
+        ]
+      },
+      "OfficialReleaseDraft": {
+        "if": "github.repository == 'official-stockfish/Stockfish'",
+        "runs-on": "ubuntu-slim",
+        "needs": [
+          "Matrix"
+        ],
+        "outputs": {
+          "release_tag": "${{ steps.release_metadata.outputs.release_tag }}"
+        },
+        "permissions": {
+          "contents": "write"
+        },
+        "steps": [
+          {
+            "uses": "actions/checkout@v4",
+            "with": {
+              "persist-credentials": false,
+              "fetch-depth": 0,
+              "ref": "${{ github.ref }}"
+            }
+          },
+          {
+            "name": "Validate release request",
+            "env": {
+              "RELEASE_TAG": "${{ inputs.release_tag }}",
+              "RELEASE_TITLE": "${{ inputs.release_title }}"
+            },
+            "run": "if [[ \"${{ github.ref_name }}\" != 'master' ]]; then\n  echo 'Official releases must be dispatched from master.'\n  exit 1\nfi\n\nif [[ ! \"$RELEASE_TAG\" =~ ^sf_[0-9]+(\\.[0-9]+)?$ ]]; then\n  echo 'release_tag must match sf_X or sf_X.Y'\n  exit 1\nfi\n\nif [[ -z \"$RELEASE_TITLE\" ]]; then\n  echo 'release_title is required.'\n  exit 1\nfi\n"
+          },
+          {
+            "name": "Compute release metadata",
+            "id": "release_metadata",
+            "run": "echo \"release_tag=${{ inputs.release_tag }}\" >> $GITHUB_OUTPUT"
+          },
+          {
+            "name": "Ensure tag does not already exist",
+            "env": {
+              "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"
+            },
+            "run": "gh release view \"${{ inputs.release_tag }}\" >/dev/null 2>&1 && { echo 'Release already exists for this tag.'; exit 1; } || true"
+          },
+          {
+            "name": "Ensure git tag does not already exist",
+            "env": {
+              "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"
+            },
+            "run": "gh api \"repos/${{ github.repository }}/git/ref/tags/${{ inputs.release_tag }}\" >/dev/null 2>&1 && { echo 'Tag already exists.'; exit 1; } || true"
+          },
+          {
+            "name": "Create official release tag",
+            "env": {
+              "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"
+            },
+            "run": "gh api \"repos/${{ github.repository }}/git/refs\" -f ref=\"refs/tags/${{ inputs.release_tag }}\" -f sha=\"${{ github.sha }}\""
+          },
+          {
+            "name": "Create draft official release",
+            "env": {
+              "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"
+            },
+            "run": "gh release create \"${{ inputs.release_tag }}\" --draft --title \"${{ inputs.release_title }}\" --notes ''"
+          }
+        ]
+      },
+      "UniversalCompilation": {
+        "needs": [
+          "Matrix"
+        ],
+        "uses": "./.github/workflows/universal_compilation.yml"
+      },
+      "ARMCompilation": {
+        "needs": [
+          "Matrix"
+        ],
+        "uses": "./.github/workflows/arm_compilation.yml",
+        "with": {
+          "matrix": "${{ needs.Matrix.outputs.arm_matrix }}"
+        }
+      },
+      "OfficialBinaries": {
+        "if": "github.repository == 'official-stockfish/Stockfish'",
+        "needs": [
+          "OfficialReleaseDraft",
+          "Matrix",
+          "UniversalCompilation"
+        ],
+        "uses": "./.github/workflows/upload_binaries.yml",
+        "with": {
+          "matrix": "${{ needs.Matrix.outputs.universal_matrix }}",
+          "release_tag": "${{ needs.OfficialReleaseDraft.outputs.release_tag }}",
+          "release_prerelease": false
+        },
+        "permissions": {
+          "contents": "write"
+        },
+        "secrets": {
+          "token": "${{ secrets.GITHUB_TOKEN }}"
+        }
+      },
+      "OfficialARMBinaries": {
+        "if": "github.repository == 'official-stockfish/Stockfish'",
+        "needs": [
+          "OfficialReleaseDraft",
+          "Matrix",
+          "ARMCompilation"
+        ],
+        "uses": "./.github/workflows/upload_binaries.yml",
+        "with": {
+          "matrix": "${{ needs.Matrix.outputs.arm_matrix }}",
+          "release_tag": "${{ needs.OfficialReleaseDraft.outputs.release_tag }}",
+          "release_prerelease": false
+        },
+        "permissions": {
+          "contents": "write"
+        },
+        "secrets": {
+          "token": "${{ secrets.GITHUB_TOKEN }}"
+        }
+      }
+    }
+  },
+  "upload_binaries": {
+    "name": "Upload Binaries",
+    "on": {
+      "workflow_call": {
+        "inputs": {
+          "matrix": {
+            "type": "string",
+            "required": true
+          },
+          "release_tag": {
+            "type": "string",
+            "required": false
+          },
+          "release_prerelease": {
+            "type": "boolean",
+            "required": false
+          }
+        },
+        "secrets": {
+          "token": {
+            "required": true
+          }
+        }
+      }
+    },
+    "jobs": {
+      "Artifacts": {
+        "name": "${{ matrix.config.name }} ${{ matrix.binaries }}",
+        "runs-on": "ubuntu-slim",
+        "env": {
+          "EXT": "${{ matrix.config.ext }}",
+          "NAME": "${{ matrix.config.simple_name }}",
+          "BINARY": "${{ matrix.binaries }}"
+        },
+        "strategy": {
+          "fail-fast": false,
+          "matrix": "${{ fromJson(inputs.matrix) }}"
+        },
+        "defaults": {
+          "run": {
+            "shell": "bash"
+          }
+        },
+        "steps": [
+          {
+            "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            "with": {
+              "persist-credentials": false
+            }
+          },
+          {
+            "name": "Download artifact from compilation",
+            "uses": "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+            "with": {
+              "name": "${{ matrix.config.simple_name }} ${{ matrix.binaries }}",
+              "path": "${{ matrix.config.simple_name }} ${{ matrix.binaries }}"
+            }
+          },
+          {
+            "name": "Create Package",
+            "run": "mkdir stockfish\n"
+          },
+          {
+            "name": "Download wiki",
+            "run": "git clone https://github.com/official-stockfish/Stockfish.wiki.git wiki\nrm -rf wiki/.git\nmv wiki stockfish/\n"
+          },
+          {
+            "name": "Copy files",
+            "run": "mv \"${{ matrix.config.simple_name }} ${{ matrix.binaries }}\" stockfish-workflow\ncd stockfish-workflow\ncp -r src ../stockfish/\ncp -r scripts ../stockfish/\ncp stockfish-$NAME-$BINARY$EXT ../stockfish/\ncp \"Top CPU Contributors.txt\" ../stockfish/\ncp Copying.txt ../stockfish/\ncp AUTHORS ../stockfish/\ncp CITATION.cff ../stockfish/\ncp README.md ../stockfish/\ncp CONTRIBUTING.md ../stockfish/\n"
+          },
+          {
+            "name": "Create tar",
+            "if": "${{ startsWith(matrix.config.archive_ext, 'tar') }}",
+            "run": "chmod +x ./stockfish/stockfish-$NAME-$BINARY$EXT\ntar -cavf stockfish-$NAME-$BINARY.\"${{ matrix.config.archive_ext }}\" stockfish\n"
+          },
+          {
+            "name": "Create zip",
+            "if": "${{ matrix.config.archive_ext == 'zip' }}",
+            "run": "zip -r stockfish-$NAME-$BINARY.zip stockfish\n"
+          },
+          {
+            "name": "Upload Draft Release Asset",
+            "if": "inputs.release_tag != ''",
+            "uses": "softprops/action-gh-release@4634c16e79c963813287e889244c50009e7f0981",
+            "with": {
+              "tag_name": "${{ inputs.release_tag }}",
+              "draft": true,
+              "prerelease": "${{ inputs.release_prerelease }}",
+              "files": "stockfish-${{ matrix.config.simple_name }}-${{ matrix.binaries }}.${{ matrix.config.archive_ext }}",
+              "token": "${{ secrets.token }}"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
